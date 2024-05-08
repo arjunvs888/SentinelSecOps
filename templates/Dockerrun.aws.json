@@ -1,0 +1,15 @@
+{
+  "AWSEBDockerrunVersion": "1",
+  "Image": {
+    "Name": "$IMG_VERSION"
+  },
+  "Authentication": {
+    "Bucket": "$AWS_S3_BUCKET",
+    "Key": "auth.json"
+  },
+  "Ports": [
+    {
+      "ContainerPort": 3000
+    }
+  ]
+}

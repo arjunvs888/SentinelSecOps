@@ -1,0 +1,226 @@
+stages:
+  - build
+  - test
+  - pre-prod
+  - dast
+  - review
+  - prod
+
+
+
+variables:
+  DOCKER_DRIVER: overlay2
+  SNYK_TOKEN: $SNYK_TOKEN
+  APP_VERSION: $CI_PIPELINE_IID
+  IMG_VERSION: $CI_REGISTRY_IMAGE:$APP_VERSION
+  AWS_URL: "<Your AWS EBS URL>:3000"
+  NMAP_URL: "<Your AWS EBS URL>"
+  EBS_APP: ""
+  EBS_ENV: ""
+  ARTIFACTS_DIR: "artifacts"
+before_script:
+  - mkdir -p $ARTIFACTS_DIR
+
+docker-build:
+  stage: build
+  when: manual
+  image: docker:latest
+  services:
+    - docker:dind
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin $CI_REGISTRY
+  script:
+    - echo "Building Docker image..."
+    - docker version
+    - docker build --progress=plain -t $CI_REGISTRY_IMAGE -t $CI_REGISTRY_IMAGE:$APP_VERSION .
+    - docker image ls
+    - docker push --all-tags $CI_REGISTRY_IMAGE
+
+snyk_scan:
+  stage: test
+  when: manual
+  allow_failure: true
+  needs: 
+  - docker-build
+  image:
+    name: snyk/snyk:docker
+    entrypoint:
+      - ''
+  services:
+    - docker:20.10.11-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ''
+  script:
+    - echo "Running Snyk vulnerability scan..."
+    - docker run -d --name snyk-container -v /var/run/docker.sock:/var/run/docker.sock snyk/snyk:docker sleep infinity
+    - docker exec snyk-container snyk auth $SNYK_TOKEN
+    - docker exec snyk-container snyk test -d --username=$CI_REGISTRY_USER --password=$CI_REGISTRY_PASSWORD --docker $IMG_VERSION --json > snyk_report.json || true
+    # - docker exec snyk-container snyk test --username=$CI_REGISTRY_USER --password=$CI_REGISTRY_PASSWORD --docker $CI_REGISTRY_IMAGE:$APP_VERSION --json-file-output=snyk_report.json || true  # Save results to JSON    
+    - docker stop snyk-container
+    - docker rm snyk-container
+  artifacts:
+    paths:
+      - snyk_report.json
+
+snyk_to_html:
+  image: node:lts-alpine3.19
+  stage: test
+  needs: 
+    - snyk_scan
+  script:
+      - npm install snyk-to-html -g
+      - snyk-to-html -d -a -i snyk_report.json -o snyk_report.html
+  artifacts:
+      paths:
+          - snyk_report.json
+          - snyk_report.html
+
+trivy_container_scanning:
+  stage: test
+  when: manual
+  image: docker:stable
+  needs: 
+  - docker-build
+  services:
+    - name: docker:dind
+      entrypoint: ["env", "-u", "DOCKER_HOST"]
+      command: ["dockerd-entrypoint.sh"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375/
+    DOCKER_DRIVER: overlay2
+    DOCKER_TLS_CERTDIR: ""
+    IMAGE: $IMG_VERSION
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin $CI_REGISTRY
+    - export TRIVY_VERSION=$(wget -qO - "https://api.github.com/repos/aquasecurity/trivy/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+    - echo $TRIVY_VERSION
+    - wget --no-verbose https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz -O - | tar -zxvf -
+  script:
+  # Build report
+  - ./trivy --cache-dir .trivycache/ image $IMAGE --no-progress --format template --template "@contrib/gitlab.tpl" -o gl-container-scanning-report.json
+  # Print report
+  - ./trivy --cache-dir .trivycache/ image $IMAGE --no-progress --severity HIGH
+  # Fail on critical vulnerability
+  - ./trivy --cache-dir .trivycache/ image $IMAGE --severity CRITICAL --no-progress
+  cache:
+    paths:
+      - .trivycache/
+  artifacts:
+    reports:
+        container_scanning: gl-container-scanning-report.json
+    paths:
+        - gl-container-scanning-report.json
+
+deploy_to_pre_prod:
+    image:
+        name: amazon/aws-cli:2.15.32
+        entrypoint: [""]
+    stage: pre-prod
+    when: manual
+    variables:
+        APP_NAME: $EBS_APP
+        APP_ENV_NAME: $EBS_ENV
+    # environment: test
+    script:
+        - aws --version
+        - yum install -y gettext
+        - export DEPLOY_TOKEN=$(echo $GITLAB_DEPLOY_TOKEN | tr -d "\n" | base64)
+        - envsubst < templates/Dockerrun.aws.json > Dockerrun.aws.json
+        - envsubst < templates/auth.json > auth.json
+        - cat Dockerrun.aws.json
+        - cat auth.json
+        - aws s3 cp Dockerrun.aws.json s3://$AWS_S3_BUCKET/Dockerrun.aws.json
+        - aws s3 cp auth.json s3://$AWS_S3_BUCKET/auth.json
+        - aws elasticbeanstalk create-application-version --application-name "$APP_NAME" --version-label $APP_VERSION --source-bundle S3Bucket=$AWS_S3_BUCKET,S3Key=Dockerrun.aws.json
+        - aws elasticbeanstalk update-environment --application-name "$APP_NAME" --version-label $APP_VERSION --environment-name $APP_ENV_NAME
+        - aws elasticbeanstalk wait environment-updated --application-name "$APP_NAME" --version-label $APP_VERSION --environment-name $APP_ENV_NAME
+
+zap_scan:
+  stage: dast
+  image: docker:latest
+  when: manual
+  needs: 
+    - deploy_to_pre_prod
+  allow_failure: true
+  services:
+    - docker:dind
+  script:
+    - echo "Running OWASP ZAP security scan..."
+    - docker run --name zap -p 8090:8090 -i softwaresecurityproject/zap-bare zap.sh -cmd -port 8090 -quickurl $AWS_URL -quickout /zap/zap_report.json
+    - docker cp zap:/zap/zap_report.json zap_report.json
+    - docker rm -f zap
+
+  artifacts:
+    paths:
+      - zap_report.json
+
+pentest_stage:
+  stage: dast
+  image: alpine:latest
+  when: manual
+  needs: 
+    - deploy_to_pre_prod
+  script:
+      # Install nmap:
+      - apk add nmap --no-cache
+      - apk add nmap-scripts 
+      - apk add libxslt && rm -f /var/cache/apk/*
+      - wget https://raw.githubusercontent.com/Haxxnet/nmap-bootstrap-xsl/main/nmap-bootstrap.xsl
+      - nmap -sC -sV -p - -T4 -O -n -Pn --stylesheet nmap-bootstrap.xsl $NMAP_URL -oX nmap_advanced_portscan
+      - xsltproc -o nmap_scan.html nmap-bootstrap.xsl nmap_advanced_portscan
+  artifacts:
+      paths:
+          - nmap_scan.html
+
+issue_creation:
+  image: python:3.11.9-alpine3.19
+  stage: review
+  # when: manual
+  needs:
+    - snyk_scan
+    - snyk_to_html
+    - trivy_container_scanning
+    - zap_scan
+    - pentest_stage
+  script:
+      # Install any necessary dependencies first:
+      - pip install --no-cache-dir -r scripts/requirements.txt
+      - ls *.json
+      - python scripts/issue_creator.py
+  artifacts:
+      paths:
+          - snyk_report.json
+          - snyk_report.html
+          - zap_report.json
+          - gl-container-scanning-report.json
+          - enhanced_vulnerability_assessment_report.html
+
+deploy_to_prod:
+    image:
+        name: amazon/aws-cli:2.15.32
+        entrypoint: [""]
+    stage: prod
+    when: manual
+    needs:
+    - deploy_to_pre_prod
+    - issue_creation
+
+    variables:
+        APP_NAME: $EBS_APP
+        APP_ENV_NAME: $EBS_ENV
+    # environment: test
+    script:
+        - aws --version
+        - yum install -y gettext
+        - export DEPLOY_TOKEN=$(echo $GITLAB_DEPLOY_TOKEN | tr -d "\n" | base64)
+        - envsubst < templates/Dockerrun.aws.json > Dockerrun.aws.json
+        - envsubst < templates/auth.json > auth.json
+        - cat Dockerrun.aws.json
+        - cat auth.json
+        - aws s3 cp Dockerrun.aws.json s3://$AWS_S3_BUCKET/Dockerrun.aws.json
+        - aws s3 cp auth.json s3://$AWS_S3_BUCKET/auth.json
+        - aws elasticbeanstalk create-application-version --application-name "$APP_NAME" --version-label $APP_VERSION --source-bundle S3Bucket=$AWS_S3_BUCKET,S3Key=Dockerrun.aws.json
+        - aws elasticbeanstalk update-environment --application-name "$APP_NAME" --version-label $APP_VERSION --environment-name $APP_ENV_NAME
+        - aws elasticbeanstalk wait environment-updated --application-name "$APP_NAME" --version-label $APP_VERSION --environment-name $APP_ENV_NAME
+
